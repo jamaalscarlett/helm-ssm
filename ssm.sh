@@ -114,6 +114,10 @@ echo -e "${GREEN}[SSM]${NOC} Value files: ${VALUE_FILES[@]}"
 
 set +e # we disable fail-dast because we want to give the user a proper error message in case we cant read the value file
 MERGED_TEXT=""
+NEW_VALUE_FILES=()
+COUNT=0
+VALUE_FILES_DIR=`mktemp -d`
+
 for FILEPATH in "${VALUE_FILES[@]}"; do
     echo -e "${GREEN}[SSM]${NOC} Reading ${FILEPATH}"
 
@@ -122,57 +126,56 @@ for FILEPATH in "${VALUE_FILES[@]}"; do
         exit 1
     fi
 
-    VALUE=$(cat ${FILEPATH} 2> /dev/null) # read the content of the values file silently (without outputing an error in case it fails)
-    EXIT_CODE=$?
-
+    # If the file does not contain any ssm values just add it to the array
+    VALUE=$(echo "`cat ${FILEPATH}`" 2> /dev/null) # read the content of the values file silently (without outputing an error in case it fails)
     if [[ ${EXIT_CODE} -ne 0 ]]; then
         echo -e "${RED}[SSM]${NOC} Error: open ${FILEPATH}: failed to read contents" >&2
         exit 1
     fi
 
-    VALUE=$(echo -e "${VALUE}" | sed s/\%/\%\%/g) # we turn single % to %% to escape percent signs
-    printf -v MERGED_TEXT "${MERGED_TEXT}\n${VALUE}" # We concat the files together with a newline in between using printf and put output into variable MERGED_TEXT
+    PARAMETERS=$(echo -e "${VALUE}" | grep -Eo "\{\{ssm [^\}]+\}\}")
+    PARAMETERS_LENGTH=$(echo "${PARAMETERS}" | grep -v '^$' | wc -l | xargs)
+    if [ "${PARAMETERS_LENGTH}" != 0 ]; then
+        echo -e "${GREEN}[SSM]${NOC} Found $(echo "${PARAMETERS}" | grep -v '^$' | wc -l | xargs) parameters"
+        echo -e "${GREEN}[SSM]${NOC} Parameters: \n${PARAMETERS[@]}"
+        VALUE=$(echo -e "${VALUE}" | sed s/\%/\%\%/g) # we turn single % to %% to escape percent signs
+        # using 'while' instead of 'for' allows us to use newline as a delimiter instead of a space
+        while read -r PARAM_STRING; do
+            [ -z "${PARAM_STRING}" ] && continue # if parameter is empty for some reason
+
+            CLEANED_PARAM_STRING=$(echo ${PARAM_STRING:2} | rev | cut -c 3- | rev) # we cut the '{{' and '}}' at the beginning and end
+            PARAM_PATH=$(echo ${CLEANED_PARAM_STRING:2} | cut -d' ' -f 2) # {{ssm */param/path* us-east-1}}
+            REGION=$(echo ${CLEANED_PARAM_STRING:2} | cut -d' ' -f 3) # {{ssm /param/path *us-east-1*}}
+            PROFILE=$(echo ${CLEANED_PARAM_STRING:2} | cut -d' ' -f 4) # {{ssm /param/path us-east-1 *production*}}
+            if [[ -n ${PROFILE}  ]]; then
+            PROFILE_PARAM="--profile ${PROFILE}"
+            fi
+            PARAM_OUTPUT="$(aws ssm get-parameter --with-decryption --name ${PARAM_PATH} --output text --query Parameter.Value --region ${REGION} $PROFILE_PARAM  2>&1)" # Get the parameter value or error message
+            EXIT_CODE=$?
+
+            if [[ ${EXIT_CODE} -ne 0 ]]; then
+                echo -e "${RED}[SSM]${NOC} Error: Could not get parameter: ${PARAM_PATH}. AWS cli output: ${PARAM_OUTPUT}" >&2
+                exit 1
+            fi
+
+            SECRET_TEXT="$(echo -e "${PARAM_OUTPUT}" | sed -e 's/[]\&\/$*.^[]/\\&/g')"
+            VALUE=$(echo -e "${VALUE}" | sed "s|${PARAM_STRING}|${SECRET_TEXT}|g")
+            echo "${VALUE}" > ${VALUE_FILES_DIR}/temp-values-${COUNT}.yaml
+            sleep 0.5 # very basic rate limits
+            NEW_VALUE_FILES+=( "-f" "${VALUE_FILES_DIR}/temp-values-${COUNT}.yaml" )
+        done <<< "${PARAMETERS}"
+    else
+        echo -e "${GREEN}[SSM]${NOC} No parameters were found, continuing..."
+        cp ${FILEPATH} ${VALUE_FILES_DIR}/temp-values-${COUNT}.yaml
+        NEW_VALUE_FILES+=( "-f" "${VALUE_FILES_DIR}/temp-values-${COUNT}.yaml" )
+    fi
+    COUNT+=1
 done
 
-PARAMETERS=$(echo -e "${MERGED_TEXT}" | grep -Eo "\{\{ssm [^\}]+\}\}") # Look for {{ssm /path/to/param us-east-1}} patterns, delete empty lines
-PARAMETERS_LENGTH=$(echo "${PARAMETERS}" | grep -v '^$' | wc -l | xargs)
-if [ "${PARAMETERS_LENGTH}" != 0 ]; then
-    echo -e "${GREEN}[SSM]${NOC} Found $(echo "${PARAMETERS}" | grep -v '^$' | wc -l | xargs) parameters"
-    echo -e "${GREEN}[SSM]${NOC} Parameters: \n${PARAMETERS[@]}"
-else
-    echo -e "${GREEN}[SSM]${NOC} No parameters were found, continuing..."
-fi
-echo -e "==============================================="
-
-
 set +e
-# using 'while' instead of 'for' allows us to use newline as a delimiter instead of a space
-while read -r PARAM_STRING; do
-    [ -z "${PARAM_STRING}" ] && continue # if parameter is empty for some reason
-
-    CLEANED_PARAM_STRING=$(echo ${PARAM_STRING:2} | rev | cut -c 3- | rev) # we cut the '{{' and '}}' at the beginning and end
-    PARAM_PATH=$(echo ${CLEANED_PARAM_STRING:2} | cut -d' ' -f 2) # {{ssm */param/path* us-east-1}}
-    REGION=$(echo ${CLEANED_PARAM_STRING:2} | cut -d' ' -f 3) # {{ssm /param/path *us-east-1*}}
-    PROFILE=$(echo ${CLEANED_PARAM_STRING:2} | cut -d' ' -f 4) # {{ssm /param/path us-east-1 *production*}}
-    if [[ -n ${PROFILE}  ]]; then
-       PROFILE_PARAM="--profile ${PROFILE}"  
-    fi
-    PARAM_OUTPUT="$(aws ssm get-parameter --with-decryption --name ${PARAM_PATH} --output text --query Parameter.Value --region ${REGION} $PROFILE_PARAM  2>&1)" # Get the parameter value or error message
-    EXIT_CODE=$?
-
-    if [[ ${EXIT_CODE} -ne 0 ]]; then
-        echo -e "${RED}[SSM]${NOC} Error: Could not get parameter: ${PARAM_PATH}. AWS cli output: ${PARAM_OUTPUT}" >&2
-        exit 1
-    fi
-
-    SECRET_TEXT="$(echo -e "${PARAM_OUTPUT}" | sed -e 's/[]\&\/$*.^[]/\\&/g')"
-    MERGED_TEXT=$(echo -e "${MERGED_TEXT}" | sed "s|${PARAM_STRING}|${SECRET_TEXT}|g")
-    sleep 0.5 # very basic rate limits
-done <<< "${PARAMETERS}"
-
-set +e
-echo -e "${MERGED_TEXT}" | helm "${OPTIONS[@]}" --values -
+helm "${OPTIONS[@]}" "${NEW_VALUE_FILES[@]}"
 EXIT_CODE=$?
+rm -r $VALUE_FILES_DIR
 if [[ ${EXIT_CODE} -ne 0 ]]; then
     echo -e "${RED}[SSM]${NOC} Helm exited with a non 0 code - this is most likely not a problem with the SSM plugin, but a problem with Helm itself." >&2
     exit ${EXIT_CODE}
